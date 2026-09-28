@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站 UP主备注 + 播放量/UP主筛选 · 链接批量提取
 // @namespace    https://local.dachuan/bili-view-filter
-// @version      1.4.1
+// @version      1.4.2
 // @description  给任意页面看到的UP主起自己的备注名（全站生效、带独立颜色）；并在搜索页/投稿页按「播放量 ≥ N」「UP主名字等于指定值（可多选）」筛选视频，自动隐藏不匹配项，批量采集链接（自动翻页/滚动，跨页按BV去重，支持复制/导出TXT/CSV）
 // @author       大川
 // @match        *://*.bilibili.com/*
@@ -16,6 +16,9 @@
 // ==/UserScript==
 
 /* 更新记录
+ * 1.4.2  默认备注颜色改为 B站蓝 #00a1d6（原来默认是粉色 #fb7299）
+ *        - 备注色改用 important 内联，防止被 B站 自身样式覆盖（如 a.up-name 自带 color 内联），
+ *          避免出现"选了颜色却看起来没变色"的情况
  * 1.4.1  给UP主备注加「手动添加入口」，并把昵称旁的「＋」做明显（原来是半透明，容易找不到）
  *        - 面板「UP主备注」区新增：粘贴空间链接或直接填 UID + 备注名 → 一点即可添加
  *        - 备注清单里点备注名即可改名 / 换颜色（手动添加的也能改）
@@ -1006,7 +1009,7 @@
   const ALIAS_BTN    = 'xh-alias-btn';
   const ALIAS_TXT    = 'xh-alias-text';
   const EDITOR_ID    = 'xh-bili-alias-editor';
-  const ALIAS_COLORS = ['#fb7299', '#ff7f27', '#f5c518', '#2ecc71', '#00a1d6', '#9b59b6', '#e74c3c', '#00b894'];
+  const ALIAS_COLORS = ['#00a1d6', '#fb7299', '#ff7f27', '#f5c518', '#2ecc71', '#9b59b6', '#e74c3c', '#00b894'];
 
   let aliasMap = {};        // { mid: { name, color, raw } }
   let aliasVersion = 0;     // 每次变更 +1，让已处理过的元素重新应用
@@ -1108,13 +1111,14 @@
       }
       if (getNameText(el) !== rec.name) setNameText(el, rec.name);
       el.classList.add(ALIAS_TXT);
-      el.style.color = rec.color || '';
+      // 用 important 内联，避免被 B站 自己的样式覆盖（否则看起来"没变色"）
+      if (rec.color) el.style.setProperty('color', rec.color, 'important');
       el.title = '原昵称：' + el.dataset.xhRaw + '（已备注）';
     } else if (el.dataset.xhRaw !== undefined) {
       // 备注已删除 → 还原原昵称
       setNameText(el, el.dataset.xhRaw);
       el.classList.remove(ALIAS_TXT);
-      el.style.color = '';
+      el.style.removeProperty('color');
       if (el.dataset.xhTitle !== undefined) el.setAttribute('title', el.dataset.xhTitle);
       else el.removeAttribute('title');
       delete el.dataset.xhRaw;
