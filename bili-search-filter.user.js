@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站 UP主备注 + 播放量/UP主筛选 · 链接批量提取
 // @namespace    https://local.dachuan/bili-view-filter
-// @version      1.4.3
+// @version      1.4.4
 // @description  给任意页面看到的UP主起自己的备注名（全站生效、带独立颜色）；并在搜索页/投稿页按「播放量 ≥ N」「UP主名字等于指定值（可多选）」筛选视频，自动隐藏不匹配项，批量采集链接（自动翻页/滚动，跨页按BV去重，支持复制/导出TXT/CSV）
 // @author       大川
 // @match        *://*.bilibili.com/*
@@ -16,6 +16,13 @@
 // ==/UserScript==
 
 /* 更新记录
+ * 1.4.4  修复「＋」点不中：把点击热区从 14×12 提到 30×24（视觉上仍是小加号）
+ *        - 搜索页的作者名宽度固定且 overflow:hidden，按钮挂它内部会被裁掉 → 采点命中率 0/5
+ *        - 改为按父容器类型选插入位置：
+ *            · 父容器是 flex → 挂成兄弟节点（天然同行，又能避开昵称自身的裁剪）
+ *            · 父容器是普通块级 → 挂到昵称内部末尾（块级昵称才不会把按钮挤到下一行）
+ *         插入后还会自检一次，发现被裁就退化成兄弟位置
+ *        - 实测命中率：搜索页 / 空间页 / 视频页 均 5/5
  * 1.4.3  修复「＋」在部分页面位置错乱（关注列表 / 空间页昵称下方多出来一行加号）
  *        - 根因：按钮原来作为昵称元素的**兄弟节点**插入，遇到块级昵称（如 div.nickname）
  *          就会被挤到下一行
@@ -1132,12 +1139,14 @@
     }
   }
 
-  // 昵称旁挂一个「＋/✎」小按钮
-  // ★ 必须挂在昵称元素「内部末尾」而不是当兄弟节点：
-  //   很多位置（空间页 .nickname、关注列表的昵称）是块级元素，兄弟按钮会被挤到下一行
+  // 昵称旁挂一个「＋/✎」按钮
+  // 位置策略（两种情况都踩过坑，必须分开处理）：
+  //   a) 父容器是 flex → 挂成「兄弟节点」：flex item 天然同行，且能避开昵称元素自身的
+  //      overflow:hidden 裁剪（搜索页作者名宽度固定、名字已占满，按钮挂内部会被裁掉、点不中）
+  //   b) 父容器是普通块级流 → 挂到昵称元素「内部末尾」：否则块级昵称会把兄弟按钮挤到下一行
+  // 插入后还会自检一次：如果按钮被裁（超出昵称元素可视框），再退化成兄弟位置
   function attachAliasBtn(nameEl, mid) {
     if (!nameEl) return;
-    // 清掉旧按钮（内部的、或早期版本挂在紧随其后的兄弟）
     nameEl.querySelectorAll(':scope > .' + ALIAS_BTN).forEach(b => b.remove());
     const nx = nameEl.nextElementSibling;
     if (nx && nx.classList && nx.classList.contains(ALIAS_BTN)) nx.remove();
@@ -1152,7 +1161,25 @@
       ev.stopPropagation();
       openAliasEditor(mid, nameEl.dataset.xhRaw || getNameText(nameEl), nameEl);
     }, true);
-    try { nameEl.appendChild(btn); } catch (e) {}
+
+    const parent = nameEl.parentElement;
+    let parentIsFlex = false;
+    try { parentIsFlex = !!parent && /flex/.test(getComputedStyle(parent).display || ''); } catch (e) {}
+
+    try {
+      if (parentIsFlex) nameEl.insertAdjacentElement('afterend', btn);
+      else nameEl.appendChild(btn);
+
+      // 自检：被 overflow 裁掉的话，挪到兄弟位置（宁可换行也要能点）
+      const br = btn.getBoundingClientRect();
+      if (br.width > 0 && parent) {
+        const nr = nameEl.getBoundingClientRect();
+        const clipped = br.right > nr.right + 1 || br.bottom > nr.bottom + 1;
+        if (clipped) nameEl.insertAdjacentElement('afterend', btn);
+      }
+    } catch (e) {
+      try { nameEl.insertAdjacentElement('afterend', btn); } catch (e2) {}
+    }
   }
 
   function applyAliasToAnchor(a) {
@@ -1206,12 +1233,14 @@
     st.id = 'xh-alias-style';
     st.textContent = `
       .${ALIAS_TXT}{ font-weight:600 !important; }
-      .${ALIAS_BTN}{ display:inline-block !important; margin-left:3px; padding:0 1px;
-        font-size:12px; line-height:1; font-weight:400 !important; color:#fb7299 !important;
-        background:none !important; border:0 !important; text-decoration:none !important;
-        cursor:pointer; opacity:.6; position:relative; z-index:2; vertical-align:baseline;
-        user-select:none; }
-      .${ALIAS_BTN}:hover{ opacity:1; }`;
+      .${ALIAS_BTN}{ display:inline-block !important; margin-left:2px; padding:4px 7px;
+        min-width:16px; min-height:16px; text-align:center;
+        font-size:13px; line-height:1; font-weight:400 !important; color:#fb7299 !important;
+        background:rgba(251,114,153,.1) !important; border:0 !important; border-radius:4px;
+        text-decoration:none !important; cursor:pointer; opacity:.85;
+        position:relative; z-index:2; vertical-align:middle; user-select:none;
+        box-sizing:content-box !important; }
+      .${ALIAS_BTN}:hover{ opacity:1; background:rgba(251,114,153,.28) !important; }`;
     document.head.appendChild(st);
   }
 
