@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站 UP主备注 + 播放量/UP主筛选 · 链接批量提取
 // @namespace    https://local.dachuan/bili-view-filter
-// @version      1.4.2
+// @version      1.4.3
 // @description  给任意页面看到的UP主起自己的备注名（全站生效、带独立颜色）；并在搜索页/投稿页按「播放量 ≥ N」「UP主名字等于指定值（可多选）」筛选视频，自动隐藏不匹配项，批量采集链接（自动翻页/滚动，跨页按BV去重，支持复制/导出TXT/CSV）
 // @author       大川
 // @match        *://*.bilibili.com/*
@@ -16,6 +16,12 @@
 // ==/UserScript==
 
 /* 更新记录
+ * 1.4.3  修复「＋」在部分页面位置错乱（关注列表 / 空间页昵称下方多出来一行加号）
+ *        - 根因：按钮原来作为昵称元素的**兄弟节点**插入，遇到块级昵称（如 div.nickname）
+ *          就会被挤到下一行
+ *        - 改为挂在昵称元素**内部末尾**，无论昵称是行内还是块级都紧跟名字同一行
+ *        - 外观改为更轻的小加号（去掉边框和底色），并加 position/z-index 防止被页面遮罩层盖住
+ *        - 顺带修掉「每次扫描都重建按钮」的低效问题
  * 1.4.2  默认备注颜色改为 B站蓝 #00a1d6（原来默认是粉色 #fb7299）
  *        - 备注色改用 important 内联，防止被 B站 自身样式覆盖（如 a.up-name 自带 color 内联），
  *          避免出现"选了颜色却看起来没变色"的情况
@@ -1126,14 +1132,16 @@
     }
   }
 
-  // 昵称旁挂一个「＋/✎」按钮（紧跟在昵称元素后面，同一个 mid 不重复挂）
+  // 昵称旁挂一个「＋/✎」小按钮
+  // ★ 必须挂在昵称元素「内部末尾」而不是当兄弟节点：
+  //   很多位置（空间页 .nickname、关注列表的昵称）是块级元素，兄弟按钮会被挤到下一行
   function attachAliasBtn(nameEl, mid) {
     if (!nameEl) return;
-    const next = nameEl.nextElementSibling;
-    if (next && next.classList && next.classList.contains(ALIAS_BTN)) {
-      if (next.dataset.xhMid === mid) { next.textContent = aliasMap[mid] ? '✎' : '＋'; return; }
-      next.remove();
-    }
+    // 清掉旧按钮（内部的、或早期版本挂在紧随其后的兄弟）
+    nameEl.querySelectorAll(':scope > .' + ALIAS_BTN).forEach(b => b.remove());
+    const nx = nameEl.nextElementSibling;
+    if (nx && nx.classList && nx.classList.contains(ALIAS_BTN)) nx.remove();
+
     const btn = document.createElement('span');
     btn.className = ALIAS_BTN;
     btn.dataset.xhMid = mid;
@@ -1144,7 +1152,7 @@
       ev.stopPropagation();
       openAliasEditor(mid, nameEl.dataset.xhRaw || getNameText(nameEl), nameEl);
     }, true);
-    try { nameEl.insertAdjacentElement('afterend', btn); } catch (e) {}
+    try { nameEl.appendChild(btn); } catch (e) {}
   }
 
   function applyAliasToAnchor(a) {
@@ -1198,10 +1206,12 @@
     st.id = 'xh-alias-style';
     st.textContent = `
       .${ALIAS_TXT}{ font-weight:600 !important; }
-      .${ALIAS_BTN}{ display:inline-block !important; margin-left:4px; padding:0 5px; font-size:11px;
-        line-height:16px; color:#fb7299; background:rgba(251,114,153,.12); border:1px solid rgba(251,114,153,.5);
-        border-radius:4px; cursor:pointer; opacity:.7; vertical-align:middle; user-select:none; font-weight:400 !important; }
-      .${ALIAS_BTN}:hover{ opacity:1; background:#fb7299; color:#fff; border-color:#fb7299; }`;
+      .${ALIAS_BTN}{ display:inline-block !important; margin-left:3px; padding:0 1px;
+        font-size:12px; line-height:1; font-weight:400 !important; color:#fb7299 !important;
+        background:none !important; border:0 !important; text-decoration:none !important;
+        cursor:pointer; opacity:.6; position:relative; z-index:2; vertical-align:baseline;
+        user-select:none; }
+      .${ALIAS_BTN}:hover{ opacity:1; }`;
     document.head.appendChild(st);
   }
 
