@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站 UP主备注 + 播放量/UP主筛选 · 链接批量提取
 // @namespace    https://local.dachuan/bili-view-filter
-// @version      1.4.0
+// @version      1.4.1
 // @description  给任意页面看到的UP主起自己的备注名（全站生效、带独立颜色）；并在搜索页/投稿页按「播放量 ≥ N」「UP主名字等于指定值（可多选）」筛选视频，自动隐藏不匹配项，批量采集链接（自动翻页/滚动，跨页按BV去重，支持复制/导出TXT/CSV）
 // @author       大川
 // @match        *://*.bilibili.com/*
@@ -16,6 +16,9 @@
 // ==/UserScript==
 
 /* 更新记录
+ * 1.4.1  给UP主备注加「手动添加入口」，并把昵称旁的「＋」做明显（原来是半透明，容易找不到）
+ *        - 面板「UP主备注」区新增：粘贴空间链接或直接填 UID + 备注名 → 一点即可添加
+ *        - 备注清单里点备注名即可改名 / 换颜色（手动添加的也能改）
  * 1.4.0  新增「UP主备注」（全站生效）：给任意页面看到的UP主起自己的备注名 + 独立颜色
  *        - 识别方式：扫描全站指向 space.bilibili.com/{mid} 的链接，自动定位其中的昵称元素
  *          （覆盖卡片作者名 / 视频页 up-name / 推荐位 span.name / 空间页顶部昵称等结构）
@@ -609,6 +612,15 @@
       background:#f6f7f8; border-radius:5px; cursor:pointer; color:#18191c; }
   .alias-hd button.mini:hover{ border-color:#fb7299; color:#fb7299; }
   .alias-list{ max-height:132px; overflow:auto; }
+  .alias-add{ margin-bottom:8px; }
+  .alias-add input{ width:100%; height:24px; padding:0 7px; border:1px solid #e3e5e7; border-radius:5px;
+      font-size:11.5px; background:#f6f7f8; color:#18191c; outline:none; }
+  .alias-add input:focus{ border-color:#fb7299; background:#fff; }
+  .alias-add-row{ display:flex; gap:4px; margin-top:4px; }
+  .alias-add-row input{ flex:1; min-width:0; }
+  .alias-add-row .mini{ height:24px; padding:0 10px; font-size:11.5px; border:1px solid #e3e5e7;
+      background:#f6f7f8; border-radius:5px; cursor:pointer; color:#18191c; flex:0 0 auto; }
+  .alias-add-row .mini:hover{ border-color:#fb7299; color:#fb7299; background:#fff; }
   .alias-item{ display:flex; align-items:center; gap:6px; padding:3px 0; font-size:12px; line-height:1.5; }
   .alias-item .dot{ width:9px; height:9px; border-radius:50%; flex:0 0 auto; }
   .alias-item .raw{ color:#9499a0; max-width:86px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:0 0 auto; }
@@ -658,6 +670,13 @@
         <button id="btnAliasExport" class="mini">导出</button>
         <button id="btnAliasImport" class="mini">导入</button>
       </div>
+      <div class="alias-add">
+        <input id="aliasUid" type="text" placeholder="粘贴UP主空间链接，或直接填 UID">
+        <div class="alias-add-row">
+          <input id="aliasName" type="text" placeholder="备注名">
+          <button id="btnAliasAdd" class="mini">添加</button>
+        </div>
+      </div>
       <div class="alias-list" id="aliasList"></div>
       <input type="file" id="aliasFile" accept=".json,application/json" style="display:none">
     </div>
@@ -698,6 +717,9 @@
       btnCsv:     sr.getElementById('btnCsv'),
       aliasList:  sr.getElementById('aliasList'),
       aliasCount: sr.getElementById('aliasCount'),
+      aliasUid:   sr.getElementById('aliasUid'),
+      aliasName:  sr.getElementById('aliasName'),
+      btnAliasAdd: sr.getElementById('btnAliasAdd'),
       btnAliasExport: sr.getElementById('btnAliasExport'),
       btnAliasImport: sr.getElementById('btnAliasImport'),
       aliasFile:  sr.getElementById('aliasFile')
@@ -839,6 +861,29 @@
       $.prog.textContent = `已导出 ${list.length} 条（CSV，含标题/UP主/播放量）${fromCollect ? '（上次采集的完整结果）' : '（仅当前页，建议先点「一键采集全部链接」）'}`;
     };
 
+    // ---- UP主备注：手动添加（填 UID 或粘贴空间链接 + 备注名）----
+    const doAddAlias = () => {
+      const rawUid = ($.aliasUid.value || '').trim();
+      const nm = ($.aliasName.value || '').trim();
+      const m = rawUid.match(/(\d{3,})/);
+      if (!m) { $.prog.textContent = '请填 UP主 的 UID，或直接粘贴他的空间链接'; $.aliasUid.focus(); return; }
+      if (!nm) { $.prog.textContent = '请填备注名'; $.aliasName.focus(); return; }
+      const mid = m[1];
+      const old = aliasMap[mid];
+      aliasMap[mid] = {
+        name: nm,
+        color: (old && old.color) || ALIAS_COLORS[0],
+        raw: (old && old.raw) || ''
+      };
+      commitAliases();
+      $.prog.textContent = `已把 UID ${mid} 备注为「${nm}」（颜色可在下方清单点名字改）`;
+      $.aliasUid.value = '';
+      $.aliasName.value = '';
+    };
+    $.btnAliasAdd.onclick = doAddAlias;
+    $.aliasName.addEventListener('keydown', ev => { if (ev.key === 'Enter') doAddAlias(); });
+    $.aliasUid.addEventListener('keydown', ev => { if (ev.key === 'Enter') doAddAlias(); });
+
     // ---- UP主备注：导出 / 导入 ----
     $.btnAliasExport.onclick = () => {
       const n = Object.keys(aliasMap).length;
@@ -901,6 +946,9 @@
       cur.className = 'cur';
       cur.textContent = rec.name;
       cur.style.color = rec.color || '';
+      cur.style.cursor = 'pointer';
+      cur.title = '点击改名 / 换颜色';
+      cur.onclick = () => openAliasEditor(mid, rec.raw || ('UID ' + mid), cur);
       const del = document.createElement('span');
       del.className = 'del';
       del.textContent = '✕';
@@ -1146,10 +1194,10 @@
     st.id = 'xh-alias-style';
     st.textContent = `
       .${ALIAS_TXT}{ font-weight:600 !important; }
-      .${ALIAS_BTN}{ display:inline-block !important; margin-left:4px; padding:0 4px; font-size:11px;
-        line-height:15px; color:#fb7299; background:rgba(251,114,153,.12); border-radius:3px;
-        cursor:pointer; opacity:.4; vertical-align:middle; user-select:none; font-weight:400 !important; }
-      .${ALIAS_BTN}:hover{ opacity:1; background:rgba(251,114,153,.3); }`;
+      .${ALIAS_BTN}{ display:inline-block !important; margin-left:4px; padding:0 5px; font-size:11px;
+        line-height:16px; color:#fb7299; background:rgba(251,114,153,.12); border:1px solid rgba(251,114,153,.5);
+        border-radius:4px; cursor:pointer; opacity:.7; vertical-align:middle; user-select:none; font-weight:400 !important; }
+      .${ALIAS_BTN}:hover{ opacity:1; background:#fb7299; color:#fff; border-color:#fb7299; }`;
     document.head.appendChild(st);
   }
 
