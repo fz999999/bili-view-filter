@@ -1,12 +1,11 @@
 // ==UserScript==
-// @name         B站 搜索页+投稿页 - 播放量/UP主 筛选 + 批量提取链接
+// @name         B站 UP主备注 + 播放量/UP主筛选 · 链接批量提取
 // @namespace    https://local.dachuan/bili-view-filter
-// @version      1.3.3
-// @description  在B站搜索页 / UP主投稿页(video、upload/video)按「播放量 ≥ N」「UP主名字等于指定值（可多选）」筛选视频，自动隐藏不匹配项，并批量采集筛选结果的链接（自动翻页/滚动，跨页按BV去重，支持复制/导出TXT/CSV）
+// @version      1.4.0
+// @description  给任意页面看到的UP主起自己的备注名（全站生效、带独立颜色）；并在搜索页/投稿页按「播放量 ≥ N」「UP主名字等于指定值（可多选）」筛选视频，自动隐藏不匹配项，批量采集链接（自动翻页/滚动，跨页按BV去重，支持复制/导出TXT/CSV）
 // @author       大川
-// @match        *://search.bilibili.com/*
-// @match        *://space.bilibili.com/*/video
-// @match        *://space.bilibili.com/*/upload/video
+// @match        *://*.bilibili.com/*
+// @match        *://bilibili.com/*
 // @icon         https://www.bilibili.com/favicon.ico
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -17,6 +16,16 @@
 // ==/UserScript==
 
 /* 更新记录
+ * 1.4.0  新增「UP主备注」（全站生效）：给任意页面看到的UP主起自己的备注名 + 独立颜色
+ *        - 识别方式：扫描全站指向 space.bilibili.com/{mid} 的链接，自动定位其中的昵称元素
+ *          （覆盖卡片作者名 / 视频页 up-name / 推荐位 span.name / 空间页顶部昵称等结构）
+ *        - 昵称旁出现「＋」，点开即可填备注名、选预设色或自定义颜色；再点「✎」可改/删
+ *        - 以 mid 为键存储，所以备注一次，全站任何位置看到该UP主都显示你的备注名
+ *        - 原昵称保留在悬停提示里；只改直接文本节点，不破坏页面内部结构（如遮罩层）
+ *        - 监听文本变化，Vue 重渲染把昵称改回去时会自动重新套用
+ *        - 筛选功能读的是「原昵称」，且按原昵称或备注名都能匹配，两者互不干扰
+ *        - 筛选面板内新增备注清单（原昵称 → 备注名，可逐条删除）与 JSON 导出/导入
+ *        - @match 扩大到全部 bilibili.com 页面；筛选面板仍只在搜索页/投稿页出现
  * 1.3.3  修复：导出TXT / 导出CSV / 复制链接 结果不完整或提示"没有可导出的结果"
  *        根因：导出时重新调 collectResults() 只读**当前页 DOM**，而「一键采集」翻页后
  *        页面停在最后一页 → 前面几页的结果全丢（最后一页 0 命中时更是完全没结果）
@@ -91,20 +100,25 @@
   // 此时 DOM 里还没有 .upload-video-card；若只靠 DOM 探测会误判成搜索页，
   // 导致播放量选择器读不到 → 全部判为不匹配（整页 0 命中）。
   function detectPage() {
-    const byUrl = /(^|\.)space\.bilibili\.com$/i.test(location.hostname);
-    const byDom = !!document.querySelector('.upload-video-card');
-    const isSpace = byDom || byUrl;
+    const host = location.hostname;
+    const isSpace  = /(^|\.)space\.bilibili\.com$/i.test(host) || !!document.querySelector('.upload-video-card');
+    const isSearch = /^search\.bilibili\.com$/i.test(host) || !!document.querySelector('.search-page');
 
     if (isSpace) {
       S = SPACE_S;
       PAGE = { kind: 'space' };
       // 作者名在页面头部，可能晚于卡片渲染：读到才覆盖，读不到先保留，下次再试
+      // （元素文本可能已被备注改写，优先取保存下来的原昵称）
       const n = document.querySelector('.upinfo-detail .nickname, .upinfo__main .nickname, .nickname');
-      const name = n ? n.textContent.trim() : '';
+      const name = n ? (n.dataset.xhRaw || getNameText(n)) : '';
       if (name) spaceOwner = name;
-    } else {
+    } else if (isSearch) {
       S = SEARCH_S;
       PAGE = { kind: 'search' };
+      spaceOwner = '';
+    } else {
+      S = SEARCH_S;
+      PAGE = { kind: 'other' };   // 其它B站页面：只跑 UP主备注，不建筛选面板
       spaceOwner = '';
     }
   }
@@ -192,10 +206,29 @@
   function readInfo(card) {
     const title  = readTitle(card);
     const aEl = S.author ? card.querySelector(S.author) : null;
-    // 投稿页无逐卡作者，统一用页面 UP主 名字
-    const author = PAGE.kind === 'space' ? spaceOwner : (aEl ? aEl.textContent.trim() : '');
-    // 页面类型也纳入签名：一旦 detectPage() 纠正了布局，缓存会自动失效重读
-    const sig = PAGE.kind + '\u0001' + title + '\u0001' + author;
+
+    // 卡片归属的 UP主 mid（用来取备注名；备注名不参与“原昵称”判定）
+    let mid = '';
+    const ownerA = card.querySelector('a[href*="space.bilibili.com/"]');
+    if (ownerA) {
+      const mm = (ownerA.getAttribute('href') || '').match(/space\.bilibili\.com\/(\d+)/);
+      if (mm) mid = mm[1];
+    }
+    const aliasName = (mid && aliasMap[mid]) ? aliasMap[mid].name : '';
+
+    // 作者名一律取「原昵称」：元素文本可能已被备注改写，优先用 dataset 里保存的原名
+    let author = '';
+    if (PAGE.kind === 'space') {
+      author = spaceOwner;
+    } else if (aEl) {
+      author = aEl.dataset.xhRaw || getNameText(aEl);
+    }
+    if (mid && aliasMap[mid] && author === aliasMap[mid].name) {
+      author = aliasMap[mid].raw || author;
+    }
+
+    // 页面类型/备注名也纳入签名：布局纠正或备注变更后，缓存会自动失效重读
+    const sig = PAGE.kind + '\u0001' + title + '\u0001' + author + '\u0001' + aliasName;
 
     const cached = infoCache.get(card);
     if (cached && cached.sig === sig) return cached;
@@ -217,7 +250,7 @@
       } catch (e) { /* ignore */ }
     }
 
-    const info = { el: card, title, author, play, url, bvid, sig };
+    const info = { el: card, title, author, aliasName, mid, play, url, bvid, sig };
     // 播放量读不到时不写缓存：B站可能"先渲染卡片、后填播放量"，
     // 缓存 NaN 会导致永远 0 命中，所以每次筛选都重试读取
     if (isFinite(play)) infoCache.set(card, info);
@@ -240,13 +273,13 @@
         if (!isFinite(info.play) || info.play < min) return false;
       }
     }
-    // UP主名字 等于 指定名字
+    // UP主名字 等于 指定名字（原昵称和你的备注名都能匹配）
     const names = splitNames(cfg.author);
     if (names.length) {
-      const a = (info.author || '').toLowerCase();
+      const cands = [info.author, info.aliasName].filter(Boolean).map(s => String(s).toLowerCase());
       const ok = names.some(n => {
         const k = n.toLowerCase();
-        return cfg.fuzzyAuthor ? a.includes(k) : a === k;
+        return cfg.fuzzyAuthor ? cands.some(c => c.includes(k)) : cands.some(c => c === k);
       });
       if (!ok) return false;
     }
@@ -568,6 +601,21 @@
       outline:none; font-family: Consolas, Menlo, monospace; }
   textarea:focus{ border-color:#fb7299; background:#fff; }
   .tip{ color:#9499a0; font-size:11.5px; line-height:1.5; margin-top:6px; }
+  .alias-sec{ margin-top:10px; border-top:1px dashed #e3e5e7; padding-top:8px; }
+  .alias-hd{ display:flex; align-items:center; gap:6px; color:#61666d; font-size:12px; margin-bottom:6px; }
+  .alias-hd .sp{ flex:1; }
+  .alias-hd b{ color:#fb7299; }
+  .alias-hd button.mini{ height:22px; padding:0 8px; font-size:11.5px; border:1px solid #e3e5e7;
+      background:#f6f7f8; border-radius:5px; cursor:pointer; color:#18191c; }
+  .alias-hd button.mini:hover{ border-color:#fb7299; color:#fb7299; }
+  .alias-list{ max-height:132px; overflow:auto; }
+  .alias-item{ display:flex; align-items:center; gap:6px; padding:3px 0; font-size:12px; line-height:1.5; }
+  .alias-item .dot{ width:9px; height:9px; border-radius:50%; flex:0 0 auto; }
+  .alias-item .raw{ color:#9499a0; max-width:86px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:0 0 auto; }
+  .alias-item .cur{ font-weight:600; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .alias-item .del{ cursor:pointer; color:#c9ccd0; flex:0 0 auto; }
+  .alias-item .del:hover{ color:#e74c3c; }
+  .alias-empty{ color:#9499a0; font-size:11.5px; line-height:1.6; }
   .fold{ position: fixed; top: 90px; right: 20px; z-index:2147483000; background:#fb7299; color:#fff;
       border-radius: 16px; padding: 6px 12px; font-size: 12.5px; cursor: pointer; box-shadow: 0 4px 14px rgba(0,0,0,.2);
       display:none; user-select:none; }
@@ -604,6 +652,15 @@
       <button id="btnCsv">导出CSV</button>
     </div>
     <div class="tip">用法：填条件 → 应用筛选 → 一键采集全部链接（自动翻页/滚动，按 BV 号去重汇总）。</div>
+    <div class="alias-sec">
+      <div class="alias-hd">UP主备注 <b id="aliasCount">0</b>
+        <span class="sp"></span>
+        <button id="btnAliasExport" class="mini">导出</button>
+        <button id="btnAliasImport" class="mini">导入</button>
+      </div>
+      <div class="alias-list" id="aliasList"></div>
+      <input type="file" id="aliasFile" accept=".json,application/json" style="display:none">
+    </div>
   </div>
 </div>`;
 
@@ -638,7 +695,12 @@
       btnCollect: sr.getElementById('btnCollect'),
       btnCopy:    sr.getElementById('btnCopy'),
       btnTxt:     sr.getElementById('btnTxt'),
-      btnCsv:     sr.getElementById('btnCsv')
+      btnCsv:     sr.getElementById('btnCsv'),
+      aliasList:  sr.getElementById('aliasList'),
+      aliasCount: sr.getElementById('aliasCount'),
+      btnAliasExport: sr.getElementById('btnAliasExport'),
+      btnAliasImport: sr.getElementById('btnAliasImport'),
+      aliasFile:  sr.getElementById('aliasFile')
     };
 
     // 回填配置
@@ -651,6 +713,7 @@
     if (cfg.collapsed) setFold(true);
 
     bindUI();
+    renderAliasList();
   }
 
   function updateStat(html) { if ($.stat) $.stat.innerHTML = html; }
@@ -775,6 +838,77 @@
       download(`bili_filtered_${stamp()}.csv`, rows.join('\r\n'));
       $.prog.textContent = `已导出 ${list.length} 条（CSV，含标题/UP主/播放量）${fromCollect ? '（上次采集的完整结果）' : '（仅当前页，建议先点「一键采集全部链接」）'}`;
     };
+
+    // ---- UP主备注：导出 / 导入 ----
+    $.btnAliasExport.onclick = () => {
+      const n = Object.keys(aliasMap).length;
+      if (!n) { $.prog.textContent = '还没有任何UP主备注'; return; }
+      download(`bili_up_alias_${stamp()}.json`, JSON.stringify(aliasMap, null, 2));
+      $.prog.textContent = `已导出 ${n} 条UP主备注（JSON）`;
+    };
+    $.btnAliasImport.onclick = () => $.aliasFile.click();
+    $.aliasFile.onchange = () => {
+      const f = $.aliasFile.files && $.aliasFile.files[0];
+      if (!f) return;
+      const fr = new FileReader();
+      fr.onload = () => {
+        try {
+          const obj = JSON.parse(String(fr.result)) || {};
+          let n = 0;
+          Object.keys(obj).forEach(mid => {
+            const v = obj[mid];
+            if (v && typeof v === 'object' && v.name) {
+              aliasMap[mid] = { name: String(v.name), color: v.color || ALIAS_COLORS[0], raw: v.raw || '' };
+              n++;
+            }
+          });
+          commitAliases();
+          $.prog.textContent = `已导入 ${n} 条UP主备注`;
+        } catch (e) {
+          $.prog.textContent = '导入失败：不是合法的备注 JSON';
+        }
+      };
+      fr.readAsText(f);
+      $.aliasFile.value = '';
+    };
+  }
+
+  // 面板里的备注清单（原昵称 → 备注名）＋逐条删除
+  function renderAliasList() {
+    const box = $ && $.aliasList;
+    if (!box) return;
+    const items = Object.entries(aliasMap);
+    if ($.aliasCount) $.aliasCount.textContent = items.length;
+    if (!items.length) {
+      box.innerHTML = '<div class="alias-empty">还没有备注。把鼠标移到任意页面UP主名字旁，点「＋」就能备注。</div>';
+      return;
+    }
+    box.innerHTML = '';
+    items.forEach(([mid, rec]) => {
+      const row = document.createElement('div');
+      row.className = 'alias-item';
+      const dot = document.createElement('span');
+      dot.className = 'dot';
+      dot.style.background = rec.color || '#fb7299';
+      const raw = document.createElement('span');
+      raw.className = 'raw';
+      raw.textContent = rec.raw || mid;
+      raw.title = 'mid: ' + mid;
+      const arrow = document.createElement('span');
+      arrow.textContent = '→';
+      arrow.style.color = '#c9ccd0';
+      const cur = document.createElement('span');
+      cur.className = 'cur';
+      cur.textContent = rec.name;
+      cur.style.color = rec.color || '';
+      const del = document.createElement('span');
+      del.className = 'del';
+      del.textContent = '✕';
+      del.title = '删除这条备注';
+      del.onclick = () => { delete aliasMap[mid]; commitAliases(); };
+      row.append(dot, raw, arrow, cur, del);
+      box.appendChild(row);
+    });
   }
 
   /* ==================== 9. 动态内容监听 ==================== */
@@ -801,22 +935,389 @@
     mo.observe(document.body, { childList: true, subtree: true });
   }
 
-  // SPA 路由变化（切换搜索 tab / 翻页 / 空间内切换频道）后重新探测并筛选
+  // SPA 路由变化：重新探测页面类型、按需增删筛选面板、重扫备注
   let lastUrl = location.href;
   setInterval(() => {
-    if (location.href !== lastUrl) {
-      lastUrl = location.href;
-      detectPage();
-      setTimeout(applyFilter, 1200);
-    }
+    if (location.href === lastUrl) return;
+    lastUrl = location.href;
+    detectPage();
+    const want = PAGE.kind === 'search' || isSpaceVideoPage();
+    const has  = !!document.getElementById(HOST_ID);
+    if (want && !has) { buildUI(); observeCards(); }
+    if (!want && has) { const h = document.getElementById(HOST_ID); if (h) h.remove(); }
+    if (want) setTimeout(applyFilter, 1200);
+    scanAliases(document, true);
   }, 1200);
 
-  /* ==================== 10. 启动 ==================== */
+  /* ==================== 10. UP主备注（全站生效，官方没有的功能） ====================
+   * 思路：B站任何地方显示UP主，几乎都是指向 space.bilibili.com/{mid} 的链接。
+   * 所以按 mid 存备注，扫描全站的这类链接、定位其中的「昵称元素」，
+   * 备注后用自定义名字 + 自定义颜色渲染；原昵称保留在 title 里。
+   */
+  const ALIAS_KEY    = 'xh_bili_up_alias_v1';
+  const ALIAS_BTN    = 'xh-alias-btn';
+  const ALIAS_TXT    = 'xh-alias-text';
+  const EDITOR_ID    = 'xh-bili-alias-editor';
+  const ALIAS_COLORS = ['#fb7299', '#ff7f27', '#f5c518', '#2ecc71', '#00a1d6', '#9b59b6', '#e74c3c', '#00b894'];
+
+  let aliasMap = {};        // { mid: { name, color, raw } }
+  let aliasVersion = 0;     // 每次变更 +1，让已处理过的元素重新应用
+
+  function loadAliases() {
+    try { aliasMap = JSON.parse(GM_getValue(ALIAS_KEY, '{}') || '{}') || {}; }
+    catch (e) { aliasMap = {}; }
+  }
+  function persistAliases() {
+    try { GM_setValue(ALIAS_KEY, JSON.stringify(aliasMap)); } catch (e) {}
+  }
+  function commitAliases() {
+    persistAliases();
+    aliasVersion++;
+    scanAliases(document, true);
+    if (typeof renderAliasList === 'function') renderAliasList();
+  }
+
+  // 明显不是昵称的文本（导航按钮 / 纯数字 / 日期时间）
+  const NOT_A_NAME = /^(收藏|已收藏|关注|已关注|粉丝|投稿|动态|主页|发消息|大会员|消息|历史|创作中心|登录|注册|下载客户端|更多|展开|收起|分享|举报|\d+)$/;
+  const DATE_LIKE  = /^\d{1,2}[-/月]\d{1,2}|\d{4}[年-]|\d+\s*(天|小时|分钟|秒)前|昨天|前天|刚刚|^·/;
+
+  function isNameText(t) {
+    const s = String(t == null ? '' : t).trim();
+    if (!s || s.length > 40) return false;
+    if (NOT_A_NAME.test(s)) return false;
+    if (DATE_LIKE.test(s)) return false;
+    return true;
+  }
+
+  // 只取元素「自己的直接文本」（避开内部子元素，例如 <a class="up-name">昵称<span class="mask"></span></a>）
+  function getNameText(el) {
+    if (!el) return '';
+    const own = Array.from(el.childNodes)
+      .filter(n => n.nodeType === 3)
+      .map(n => n.textContent).join('').trim();
+    return own || el.textContent.trim();
+  }
+
+  // 只改直接文本节点，不动内部子元素（避免把 mask 之类的结构删掉）
+  function setNameText(el, text) {
+    const textNodes = Array.from(el.childNodes).filter(n => n.nodeType === 3 && n.textContent.trim());
+    if (textNodes.length) {
+      textNodes[0].textContent = text;
+      textNodes.slice(1).forEach(n => { n.textContent = ''; });
+    } else {
+      el.textContent = text;
+    }
+  }
+
+  // 元素是否「自身就是昵称容器」
+  function isSelfNameEl(a) {
+    const own = getNameText(a);
+    if (!isNameText(own)) return false;
+    // 内部若还有明显的昵称容器，就交给它处理，别抢
+    if (a.querySelector('.bili-video-card__info--author, span.name, .nickname, .up-name__text')) return false;
+    if (/name|nickname|author|uname/i.test(a.className || '')) return true;
+    // 没有子元素（纯文本链接）也算
+    return !a.querySelector('*');
+  }
+
+  // 昵称容器的优先选择器（覆盖 B站 各页面已知结构）
+  const NAME_HINTS = [
+    '.bili-video-card__info--author',   // 首页/搜索/推荐卡片
+    'span.name',                        // 视频页推荐位、动态等
+    '.up-name', '.up-name__text', '.upname',   // 视频页主UP主
+    '.nickname', '.uname',
+    '[class*="author"]', '[class*="nickname"]', '[class*="up-name"]', '[class*="uname"]'
+  ];
+
+  // 从一个指向 space 的链接里，挑出「真正是昵称」的那个元素
+  function pickNameEl(a) {
+    for (const sel of NAME_HINTS) {
+      const el = a.querySelector(sel);
+      if (el && isNameText(el.textContent)) return el;
+    }
+    // a 自身就是昵称容器（如 <a class="up-name">昵称<span class="mask"></span></a>）
+    if (isSelfNameEl(a)) return a;
+    // 兜底：内部叶子文本元素（排除日期/计数等）
+    const leaves = [...a.querySelectorAll('*')].filter(e =>
+      e.children.length === 0 && isNameText(e.textContent) &&
+      !/date|time|desc|sign|dynamic|fans|count|num|stat|mask/i.test(e.className || ''));
+    if (leaves.length === 1) return leaves[0];
+    if (leaves.length > 1) {
+      return leaves.reduce((x, y) =>
+        x.textContent.trim().length >= y.textContent.trim().length ? x : y);
+    }
+    return null;
+  }
+
+  // 把备注套用到某个「昵称元素」上（原昵称保留在 dataset / title 里，随时可还原）
+  function applyAliasToNameEl(el, mid) {
+    if (!el) return;
+    const rec = aliasMap[mid];
+    if (rec) {
+      if (el.dataset.xhRaw === undefined) el.dataset.xhRaw = getNameText(el);
+      if (el.dataset.xhTitle === undefined && el.hasAttribute('title')) {
+        el.dataset.xhTitle = el.getAttribute('title');
+      }
+      if (getNameText(el) !== rec.name) setNameText(el, rec.name);
+      el.classList.add(ALIAS_TXT);
+      el.style.color = rec.color || '';
+      el.title = '原昵称：' + el.dataset.xhRaw + '（已备注）';
+    } else if (el.dataset.xhRaw !== undefined) {
+      // 备注已删除 → 还原原昵称
+      setNameText(el, el.dataset.xhRaw);
+      el.classList.remove(ALIAS_TXT);
+      el.style.color = '';
+      if (el.dataset.xhTitle !== undefined) el.setAttribute('title', el.dataset.xhTitle);
+      else el.removeAttribute('title');
+      delete el.dataset.xhRaw;
+      delete el.dataset.xhTitle;
+    }
+  }
+
+  // 昵称旁挂一个「＋/✎」按钮（紧跟在昵称元素后面，同一个 mid 不重复挂）
+  function attachAliasBtn(nameEl, mid) {
+    if (!nameEl) return;
+    const next = nameEl.nextElementSibling;
+    if (next && next.classList && next.classList.contains(ALIAS_BTN)) {
+      if (next.dataset.xhMid === mid) { next.textContent = aliasMap[mid] ? '✎' : '＋'; return; }
+      next.remove();
+    }
+    const btn = document.createElement('span');
+    btn.className = ALIAS_BTN;
+    btn.dataset.xhMid = mid;
+    btn.textContent = aliasMap[mid] ? '✎' : '＋';
+    btn.title = aliasMap[mid] ? '修改/删除备注' : '给这个UP主加备注';
+    btn.addEventListener('click', ev => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      openAliasEditor(mid, nameEl.dataset.xhRaw || getNameText(nameEl), nameEl);
+    }, true);
+    try { nameEl.insertAdjacentElement('afterend', btn); } catch (e) {}
+  }
+
+  function applyAliasToAnchor(a) {
+    if (!a.isConnected) return;
+    const m = (a.getAttribute('href') || '').match(/space\.bilibili\.com\/(\d+)/);
+    if (!m) return;
+    const mid = m[1];
+    const nameEl = pickNameEl(a);
+    if (!nameEl) return;
+    applyAliasToNameEl(nameEl, mid);
+    attachAliasBtn(nameEl, mid);
+  }
+
+  // 空间页顶部的大昵称不在 space 链接里，需要单独按 URL 里的 mid 处理
+  function applyAliasToSpaceHeader() {
+    if (!/(^|\.)space\.bilibili\.com$/i.test(location.hostname)) return;
+    const m = location.pathname.match(/^\/(\d+)/);
+    if (!m) return;
+    const mid = m[1];
+    const el = document.querySelector('.upinfo-detail .nickname, .upinfo__main .nickname, .nickname');
+    if (!el || el.children.length) return;
+    applyAliasToNameEl(el, mid);
+    attachAliasBtn(el, mid);
+  }
+
+  function scanAliases(root, force) {
+    const scope = (root && root.querySelectorAll) ? root : document;
+    let list = [];
+    try {
+      if (scope.matches && scope.matches('a[href*="space.bilibili.com/"]')) list.push(scope);
+      list = list.concat(Array.from(scope.querySelectorAll('a[href*="space.bilibili.com/"]')));
+    } catch (e) { return; }
+    for (const a of list) {
+      if (!a.isConnected) continue;
+      if (!force && a.dataset.xhAliasV === String(aliasVersion) && a.querySelector('.' + ALIAS_BTN)) continue;
+      try { applyAliasToAnchor(a); } catch (e) {}
+      a.dataset.xhAliasV = String(aliasVersion);
+    }
+    try { applyAliasToSpaceHeader(); } catch (e) {}
+  }
+
+  let aliasScanTimer = 0;
+  function scheduleAliasScan() {
+    clearTimeout(aliasScanTimer);
+    aliasScanTimer = setTimeout(() => scanAliases(document), 300);
+  }
+
+  function injectAliasStyle() {
+    if (document.getElementById('xh-alias-style')) return;
+    const st = document.createElement('style');
+    st.id = 'xh-alias-style';
+    st.textContent = `
+      .${ALIAS_TXT}{ font-weight:600 !important; }
+      .${ALIAS_BTN}{ display:inline-block !important; margin-left:4px; padding:0 4px; font-size:11px;
+        line-height:15px; color:#fb7299; background:rgba(251,114,153,.12); border-radius:3px;
+        cursor:pointer; opacity:.4; vertical-align:middle; user-select:none; font-weight:400 !important; }
+      .${ALIAS_BTN}:hover{ opacity:1; background:rgba(251,114,153,.3); }`;
+    document.head.appendChild(st);
+  }
+
+  /* ---------- 备注编辑浮层 ---------- */
+  let closeEditor = null;
+
+  function openAliasEditor(mid, rawName, anchorEl) {
+    if (typeof closeEditor === 'function') { try { closeEditor(); } catch (e) {} }
+    const rec = aliasMap[mid] || {};
+    let picked = rec.color || ALIAS_COLORS[0];
+
+    const host = document.createElement('div');
+    host.id = EDITOR_ID;
+    const sr = host.attachShadow({ mode: 'open' });
+    sr.innerHTML = `
+<style>
+  *{ box-sizing:border-box; font-family:-apple-system,"Microsoft YaHei",system-ui,sans-serif; }
+  .box{ position:fixed; width:272px; background:#fff; border:1px solid #e3e5e7; border-radius:10px;
+        box-shadow:0 10px 30px rgba(0,0,0,.18); font-size:13px; color:#18191c; z-index:2147483600; }
+  .hd{ display:flex; align-items:center; padding:8px 10px; background:linear-gradient(90deg,#fb7299,#fc9db8);
+       color:#fff; border-radius:9px 9px 0 0; font-weight:600; }
+  .hd .sp{ flex:1; }
+  .hd .x{ cursor:pointer; opacity:.9; font-weight:400; }
+  .bd{ padding:10px; }
+  .raw{ color:#61666d; font-size:12px; margin-bottom:6px; word-break:break-all; }
+  .raw b{ color:#18191c; }
+  .lbl{ color:#61666d; font-size:12px; margin:9px 0 5px; }
+  input[type=text]{ width:100%; height:28px; padding:0 8px; border:1px solid #e3e5e7; border-radius:6px;
+        outline:none; font-size:13px; background:#f6f7f8; color:#18191c; }
+  input[type=text]:focus{ border-color:#fb7299; background:#fff; }
+  .colors{ display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
+  .c{ width:22px; height:22px; border-radius:50%; cursor:pointer; border:2px solid transparent; }
+  .c.on{ border-color:#18191c; }
+  .btns{ display:flex; gap:6px; margin-top:10px; }
+  .btns button{ flex:1; height:28px; border:1px solid #e3e5e7; background:#f6f7f8; border-radius:6px;
+        cursor:pointer; font-size:12.5px; color:#18191c; }
+  .btns button.primary{ background:#fb7299; border-color:#fb7299; color:#fff; }
+  .btns button:hover{ border-color:#fb7299; color:#fb7299; }
+  .btns button.primary:hover{ background:#fc8bab; color:#fff; }
+  .tip{ color:#9499a0; font-size:11.5px; line-height:1.5; margin-top:8px; }
+  .msg{ color:#e74c3c; font-size:12px; margin-top:6px; min-height:15px; }
+</style>
+<div class="box" id="box">
+  <div class="hd">给 UP主 备注<span class="sp"></span><span class="x" id="x">✕</span></div>
+  <div class="bd">
+    <div class="raw">原昵称：<b id="raw"></b></div>
+    <input id="nm" type="text" maxlength="30" placeholder="输入你的备注名">
+    <div class="lbl">备注颜色</div>
+    <div class="colors" id="colors"></div>
+    <div class="btns">
+      <button class="primary" id="save">保存</button>
+      <button id="del">删除备注</button>
+    </div>
+    <div class="msg" id="msg"></div>
+    <div class="tip">备注只保存在本机；之后全站看到这个 UP主 都会显示你的备注名，鼠标悬停可看原昵称。</div>
+  </div>
+</div>`;
+    document.documentElement.appendChild(host);
+
+    sr.getElementById('raw').textContent = rawName || '(未知)';
+    const nm = sr.getElementById('nm');
+    nm.value = rec.name || '';
+
+    const colorBox = sr.getElementById('colors');
+    ALIAS_COLORS.forEach(c => {
+      const d = document.createElement('div');
+      d.className = 'c' + (c === picked ? ' on' : '');
+      d.style.background = c;
+      d.title = c;
+      d.onclick = () => { picked = c; [...colorBox.querySelectorAll('.c')].forEach(x => x.classList.toggle('on', x === d)); };
+      colorBox.appendChild(d);
+    });
+    const cst = document.createElement('input');
+    cst.type = 'color';
+    cst.value = picked;
+    cst.title = '自定义颜色';
+    cst.style.cssText = 'width:28px;height:24px;padding:0;border:1px solid #e3e5e7;border-radius:4px;background:#fff;cursor:pointer';
+    cst.oninput = () => { picked = cst.value; [...colorBox.querySelectorAll('.c')].forEach(x => x.classList.remove('on')); };
+    colorBox.appendChild(cst);
+
+    // 贴在锚点附近，并做视口边界修正
+    const r = anchorEl.getBoundingClientRect();
+    const W = 272, H = 255;
+    const box = sr.getElementById('box');
+    box.style.left = Math.min(Math.max(8, r.left), Math.max(8, window.innerWidth - W - 8)) + 'px';
+    let top = r.bottom + 8;
+    if (top + H > window.innerHeight) top = Math.max(8, r.top - H - 8);
+    box.style.top = top + 'px';
+
+    const close = () => {
+      document.removeEventListener('mousedown', onOut, true);
+      document.removeEventListener('keydown', onKey, true);
+      host.remove();
+      closeEditor = null;
+    };
+    const onOut = ev => {
+      const path = ev.composedPath ? ev.composedPath() : [];
+      if (!path.includes(host)) close();
+    };
+    const onKey = ev => { if (ev.key === 'Escape') close(); };
+    closeEditor = close;
+    setTimeout(() => {
+      document.addEventListener('mousedown', onOut, true);
+      document.addEventListener('keydown', onKey, true);
+      nm.focus();
+      nm.select();
+    }, 0);
+
+    sr.getElementById('x').onclick = close;
+    sr.getElementById('save').onclick = () => {
+      const v = nm.value.trim();
+      if (!v) { sr.getElementById('msg').textContent = '备注名不能为空'; return; }
+      aliasMap[mid] = { name: v, color: picked, raw: rawName || '' };
+      commitAliases();
+      close();
+    };
+    sr.getElementById('del').onclick = () => {
+      delete aliasMap[mid];
+      commitAliases();
+      close();
+    };
+    nm.addEventListener('keydown', ev => { if (ev.key === 'Enter') sr.getElementById('save').click(); });
+  }
+
+  function initAlias() {
+    loadAliases();
+    injectAliasStyle();
+    scanAliases(document);
+    if (!document.body) return;
+    const mo = new MutationObserver(muts => {
+      for (const m of muts) {
+        // Vue 把昵称文本改回去了 → 立刻重新套用备注
+        if (m.type === 'characterData') {
+          const p = m.target.parentElement;
+          if (p && p.closest && p.closest('a[href*="space.bilibili.com/"]')) { scheduleAliasScan(); return; }
+          continue;
+        }
+        for (const n of m.addedNodes) {
+          if (n.nodeType !== 1) continue;
+          if (n.id === EDITOR_ID) continue;
+          if (n.classList && n.classList.contains(ALIAS_BTN)) continue;
+          scheduleAliasScan();
+          return;
+        }
+      }
+    });
+    mo.observe(document.body, { childList: true, subtree: true, characterData: true });
+    // 兜底复查：应对 Vue 复用节点改写文本、或懒加载后没触发新增节点的情况
+    setInterval(() => { if (!document.hidden) scanAliases(document); }, 5000);
+  }
+
+  /* ==================== 11. 启动 ==================== */
+  const isSpaceVideoPage = () =>
+    PAGE.kind === 'space' && /\/video\/?$|\/upload\/video\/?$/.test(location.pathname);
+
+  function needPanel() {
+    detectPage();
+    return PAGE.kind === 'search' || isSpaceVideoPage();
+  }
+
   function boot() {
     detectPage();
-    buildUI();
-    observeCards();
-    setTimeout(applyFilter, 800);
+    initAlias();                       // 全站生效：UP主备注
+    if (needPanel()) {                 // 筛选面板只在搜索页 / 投稿页
+      buildUI();
+      observeCards();
+      setTimeout(applyFilter, 800);
+    }
   }
 
   if (document.readyState === 'loading') {
