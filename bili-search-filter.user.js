@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站 搜索页+投稿页 - 播放量/UP主 筛选 + 批量提取链接
 // @namespace    https://local.dachuan/bili-view-filter
-// @version      1.3.2
+// @version      1.3.3
 // @description  在B站搜索页 / UP主投稿页(video、upload/video)按「播放量 ≥ N」「UP主名字等于指定值（可多选）」筛选视频，自动隐藏不匹配项，并批量采集筛选结果的链接（自动翻页/滚动，跨页按BV去重，支持复制/导出TXT/CSV）
 // @author       大川
 // @match        *://search.bilibili.com/*
@@ -17,6 +17,12 @@
 // ==/UserScript==
 
 /* 更新记录
+ * 1.3.3  修复：导出TXT / 导出CSV / 复制链接 结果不完整或提示"没有可导出的结果"
+ *        根因：导出时重新调 collectResults() 只读**当前页 DOM**，而「一键采集」翻页后
+ *        页面停在最后一页 → 前面几页的结果全丢（最后一页 0 命中时更是完全没结果）
+ *        - 采集时把完整跨页结果存进 lastCollected，导出/复制优先使用它
+ *        - 未采集过、或筛选条件已变更时，自动回退到当前页结果
+ *        - 提示文案标注数据来源（完整采集结果 / 仅当前页）
  * 1.3.2  作者署名改为「大川」；移除仓库中的页面截图（含他人信息）
  * 1.3.1  修复：投稿页"命中 0 / 整页全隐藏"
  *        根因：Tampermonkey 在 document-idle 执行时，投稿页卡片还是 SPA 异步渲染中，
@@ -409,6 +415,27 @@
     return out;
   }
 
+  /* ---------- 导出数据源 ----------
+   * 关键：collectResults() 只能读到**当前页 DOM** 里的卡片。
+   * 而「一键采集」会翻页，结束后页面停在最后一页 —— 此时直接调 collectResults()
+   * 只能拿到最后一页的结果（前面几页全丢），最后一页恰好 0 命中时更会提示"没有可导出的结果"。
+   * 所以采集时把完整结果存下来，导出/复制优先用它；条件变了才作废回退到当前页。
+   */
+  let lastCollected = [];
+  let lastCollectedKey = '';
+
+  // 采集条件指纹：任一条件变化，旧的采集结果就不再对应当前筛选
+  const filterKey = () => [
+    cfg.minPlay, cfg.author, cfg.keyword, cfg.fuzzyAuthor ? 1 : 0
+  ].join('\u0001');
+
+  function exportList() {
+    if (lastCollected.length && lastCollectedKey === filterKey()) {
+      return { list: lastCollected, fromCollect: true };
+    }
+    return { list: collectResults(), fromCollect: false };
+  }
+
   /* ---------- 翻页支持（搜索结果 34 页需要一页页点） ---------- */
   function pagerBox() {
     return document.querySelector('.vui_pagenation') ||
@@ -697,6 +724,8 @@
       $.btnCollect.textContent = '采集中…（再点可停止）';
       try {
         const list = await collectAllPages(msg => { $.prog.textContent = msg; });
+        lastCollected = list;                 // 保存完整跨页结果，供导出/复制使用
+        lastCollectedKey = filterKey();
         applyFilter();
         $.out.value = list.map(i => `${i.title} | ${i.author} | ${fmtPlay(i.play)} | ${i.url}`).join('\n');
         $.prog.textContent = `采集完成：共 ${list.length} 条符合条件（播放量 ≥ ${cfg.minPlay || '不限'}，页数 ${cfg.maxPages || '全部'}）`;
@@ -709,8 +738,12 @@
     };
 
     $.btnCopy.onclick = () => {
-      const links = collectResults().map(i => i.url).join('\n');
-      if (!links) { $.prog.textContent = '没有可复制的结果'; return; }
+      const { list, fromCollect } = exportList();
+      const links = list.map(i => i.url).join('\n');
+      if (!links) {
+        $.prog.textContent = '没有可复制的结果：请先「应用筛选」，或点「一键采集全部链接」';
+        return;
+      }
       const n = links.split('\n').length;
       try { GM_setClipboard(links, 'text'); }
       catch (e) {
@@ -718,23 +751,29 @@
         ta.value = links; document.body.appendChild(ta); ta.select();
         document.execCommand('copy'); ta.remove();
       }
-      $.prog.textContent = `已复制 ${n} 条链接`;
+      $.prog.textContent = `已复制 ${n} 条链接${fromCollect ? '（上次采集的完整结果）' : '（仅当前页，建议先点「一键采集全部链接」）'}`;
     };
 
     $.btnTxt.onclick = () => {
-      const list = collectResults();
-      if (!list.length) { $.prog.textContent = '没有可导出的结果'; return; }
+      const { list, fromCollect } = exportList();
+      if (!list.length) {
+        $.prog.textContent = '没有可导出的结果：请先「应用筛选」，或点「一键采集全部链接」';
+        return;
+      }
       download(`bili_links_${stamp()}.txt`, list.map(i => i.url).join('\r\n'));
-      $.prog.textContent = `已导出 ${list.length} 条链接（TXT）`;
+      $.prog.textContent = `已导出 ${list.length} 条链接（TXT）${fromCollect ? '（上次采集的完整结果）' : '（仅当前页，建议先点「一键采集全部链接」）'}`;
     };
 
     $.btnCsv.onclick = () => {
-      const list = collectResults();
-      if (!list.length) { $.prog.textContent = '没有可导出的结果'; return; }
+      const { list, fromCollect } = exportList();
+      if (!list.length) {
+        $.prog.textContent = '没有可导出的结果：请先「应用筛选」，或点「一键采集全部链接」';
+        return;
+      }
       const rows = [['标题', 'UP主', '播放量', '链接'].map(csvCell).join(',')];
       list.forEach(i => rows.push([i.title, i.author, i.play, i.url].map(csvCell).join(',')));
       download(`bili_filtered_${stamp()}.csv`, rows.join('\r\n'));
-      $.prog.textContent = `已导出 ${list.length} 条（CSV，含标题/UP主/播放量）`;
+      $.prog.textContent = `已导出 ${list.length} 条（CSV，含标题/UP主/播放量）${fromCollect ? '（上次采集的完整结果）' : '（仅当前页，建议先点「一键采集全部链接」）'}`;
     };
   }
 
